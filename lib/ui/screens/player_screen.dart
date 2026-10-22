@@ -1,12 +1,14 @@
 import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:video_player/video_player.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 import '../../core/sports.dart';
 import '../../core/theme.dart';
-import '../../data/playlist_proxy.dart';
 import '../../models/models.dart';
 import '../../models/playback_target.dart';
 import '../../state/app_state.dart';
@@ -24,19 +26,14 @@ class PlayerScreen extends StatefulWidget {
 
 class _PlayerScreenState extends State<PlayerScreen>
     with WidgetsBindingObserver {
-  VideoPlayerController? _controller;
-  PlaylistProxy? _proxy;
+  WebViewController? _controller;
+  GlobalKey _webViewKey = GlobalKey();
   int _sourceIndex = 0;
   int _generation = 0;
   bool _loading = true;
   String? _error;
-  bool _muted = false;
   bool _fullscreen = false;
-  bool _controlsVisible = true;
-  bool _lastBuffering = false;
-  bool _lastPlaying = false;
-  Timer? _hideTimer;
-  Timer? _safeTimer;
+  Timer? _loadingTimer;
 
   ChannelRef get _source => widget.target.sources[_sourceIndex];
 
@@ -50,12 +47,9 @@ class _PlayerScreenState extends State<PlayerScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _hideTimer?.cancel();
-    _safeTimer?.cancel();
+    _loadingTimer?.cancel();
     _generation++;
-    _controller?.removeListener(_onVideoValue);
-    _controller?.dispose();
-    _proxy?.stop();
+    _controller = null;
     if (_fullscreen) {
       SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -67,156 +61,116 @@ class _PlayerScreenState extends State<PlayerScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
-      _controller?.pause();
+      final controller = _controller;
+      if (controller != null) {
+        unawaited(
+          controller.runJavaScript(
+            'var v=document.querySelector("video");if(v){v.pause();}',
+          ),
+        );
+      }
     }
   }
 
   Future<void> _loadSource(int index, {bool force = false}) async {
     final generation = ++_generation;
-    _safeTimer?.cancel();
+    _loadingTimer?.cancel();
     setState(() {
       _sourceIndex = index;
       _loading = true;
       _error = null;
-      _controlsVisible = true;
-      _lastBuffering = false;
-      _lastPlaying = false;
+      _controller = null;
+      _webViewKey = GlobalKey();
     });
-    await _disposeSession();
-    if (!mounted || generation != _generation) return;
 
     try {
-      final resolved = await context.app.streams
-          .resolve(widget.target.sources[index].id, force: force)
-          .timeout(const Duration(seconds: 25));
+      final html = await context.app.embeds
+          .load(widget.target.sources[index].id, force: force)
+          .timeout(const Duration(seconds: 30));
       if (!mounted || generation != _generation) return;
 
-      final proxy = PlaylistProxy(context.app.streams, resolved);
-      final url = await proxy.start().timeout(const Duration(seconds: 25));
-      if (!mounted || generation != _generation) {
-        await proxy.stop();
-        return;
-      }
-      _proxy = proxy;
-
-      final controller = VideoPlayerController.networkUrl(
-        Uri.parse(url),
-        videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
-      );
+      final controller = _createController();
       _controller = controller;
-      await controller.initialize().timeout(const Duration(seconds: 30));
-      if (!mounted || generation != _generation) {
-        await controller.dispose();
-        return;
+      await controller.setJavaScriptMode(JavaScriptMode.unrestricted);
+      await controller.setBackgroundColor(const Color(0xFF000000));
+
+      final platform = controller.platform;
+      if (platform is AndroidWebViewController) {
+        await platform.setMediaPlaybackRequiresUserGesture(false);
       }
-      await controller.setVolume(_muted ? 0 : 1);
-      await controller.play();
-      controller.addListener(_onVideoValue);
+
+      await controller.setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (_) {
+            if (!mounted || generation != _generation) return;
+            _loadingTimer?.cancel();
+            setState(() => _loading = false);
+          },
+          onWebResourceError: (error) {
+            if (!mounted || generation != _generation) return;
+            if (error.isForMainFrame != true) return;
+            _fail(
+              'No se pudo cargar el reproductor. Revisa tu conexión e inténtalo de nuevo.',
+            );
+          },
+          onNavigationRequest: (request) {
+            final uri = Uri.tryParse(request.url);
+            if (uri == null) return NavigationDecision.prevent;
+            const safeSchemes = {'about', 'data', 'blob'};
+            if (safeSchemes.contains(uri.scheme)) {
+              return NavigationDecision.navigate;
+            }
+            if (uri.host == 'dembed.st' || uri.host.endsWith('.dembed.st')) {
+              return NavigationDecision.navigate;
+            }
+            return NavigationDecision.prevent;
+          },
+        ),
+      );
+
+      await controller.loadHtmlString(
+        html,
+        baseUrl: 'https://dembed.st/premiumtv/',
+      );
       if (!mounted || generation != _generation) return;
-      setState(() {
-        _loading = false;
-        _controlsVisible = true;
+      _loadingTimer = Timer(const Duration(seconds: 12), () {
+        if (!mounted || generation != _generation || !_loading) return;
+        setState(() => _loading = false);
       });
-      _scheduleHide();
     } catch (_) {
       if (!mounted || generation != _generation) return;
-      final controller = _controller;
+      _fail(
+        'La señal no respondió. Puede estar fuera de línea o requerir otra fuente.',
+      );
+    }
+  }
+
+  WebViewController _createController() {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return WebViewController.fromPlatformCreationParams(
+        WebKitWebViewControllerCreationParams(
+          mediaTypesRequiringUserAction: const <PlaybackMediaTypes>{},
+          allowsInlineMediaPlayback: true,
+          javaScriptCanOpenWindowsAutomatically: false,
+        ),
+      );
+    }
+    return WebViewController.fromPlatformCreationParams(
+      AndroidWebViewControllerCreationParams(),
+    );
+  }
+
+  void _fail(String message) {
+    if (!mounted) return;
+    _loadingTimer?.cancel();
+    setState(() {
+      _loading = false;
+      _error = message;
       _controller = null;
-      controller?.removeListener(_onVideoValue);
-      await controller?.dispose();
-      await _proxy?.stop();
-      _proxy = null;
-      if (!mounted || generation != _generation) return;
-      setState(() {
-        _loading = false;
-        _controlsVisible = false;
-        _error =
-            'La señal no respondió. Puede estar fuera de línea o requerir otra fuente.';
-      });
-    }
-  }
-
-  Future<void> _disposeSession() async {
-    _hideTimer?.cancel();
-    final controller = _controller;
-    _controller = null;
-    controller?.removeListener(_onVideoValue);
-    await controller?.dispose();
-    final proxy = _proxy;
-    _proxy = null;
-    await proxy?.stop();
-  }
-
-  void _onVideoValue() {
-    final controller = _controller;
-    if (controller == null) return;
-    final value = controller.value;
-    if (value.hasError && _error == null) {
-      setState(() {
-        _loading = false;
-        _controlsVisible = false;
-        _error =
-            'No pudimos reproducir esta fuente. Prueba con otra señal o vuelve a intentar.';
-      });
-      return;
-    }
-    if (value.isBuffering != _lastBuffering ||
-        value.isPlaying != _lastPlaying) {
-      _lastBuffering = value.isBuffering;
-      _lastPlaying = value.isPlaying;
-      if (mounted) setState(() {});
-    }
-  }
-
-  void _scheduleHide() {
-    _hideTimer?.cancel();
-    _safeTimer?.cancel();
-    final controller = _controller;
-    if (controller == null ||
-        _loading ||
-        _error != null ||
-        !controller.value.isPlaying) {
-      return;
-    }
-    _hideTimer = Timer(const Duration(milliseconds: 3600), () {
-      if (mounted) setState(() => _controlsVisible = false);
     });
-  }
-
-  void _toggleControls() {
-    if (_loading || _error != null) return;
-    setState(() => _controlsVisible = !_controlsVisible);
-    if (_controlsVisible) {
-      _scheduleHide();
-    } else {
-      _hideTimer?.cancel();
-    }
-  }
-
-  Future<void> _togglePlay() async {
-    final controller = _controller;
-    if (controller == null || !controller.value.isInitialized) return;
-    if (controller.value.isPlaying) {
-      await controller.pause();
-      _hideTimer?.cancel();
-      setState(() => _controlsVisible = true);
-    } else {
-      await controller.play();
-      _scheduleHide();
-    }
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _toggleMute() async {
-    final controller = _controller;
-    if (controller == null) return;
-    _muted = !_muted;
-    await controller.setVolume(_muted ? 0 : 1);
-    if (mounted) setState(() {});
   }
 
   Future<void> _toggleFullscreen() async {
-    _hideTimer?.cancel();
     if (_fullscreen) {
       await _exitFullscreen();
     } else {
@@ -227,7 +181,6 @@ class _PlayerScreenState extends State<PlayerScreen>
       ]);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     }
-    if (mounted) _scheduleHide();
   }
 
   Future<void> _exitFullscreen() async {
@@ -241,9 +194,6 @@ class _PlayerScreenState extends State<PlayerScreen>
   Widget build(BuildContext context) {
     final p = context.palette;
     final style = sportStyleFor(widget.target.category ?? '');
-    final ratio = _controller?.value.isInitialized == true
-        ? _controller!.value.aspectRatio
-        : 16 / 9;
 
     return PopScope(
       canPop: !_fullscreen,
@@ -257,14 +207,14 @@ class _PlayerScreenState extends State<PlayerScreen>
         child: AnnotatedRegion<SystemUiOverlayStyle>(
           value: SystemUiOverlayStyle.light,
           child: _fullscreen
-              ? _buildFullscreen(style, ratio)
-              : _buildPortrait(p, style, ratio),
+              ? _buildFullscreen()
+              : _buildPortrait(p, style),
         ),
       ),
     );
   }
 
-  Widget _buildPortrait(Palette p, SportStyle style, double ratio) {
+  Widget _buildPortrait(Palette p, SportStyle style) {
     return ColoredBox(
       color: p.background,
       child: CustomScrollView(
@@ -275,21 +225,16 @@ class _PlayerScreenState extends State<PlayerScreen>
               color: const Color(0xFF000000),
               padding: EdgeInsets.only(top: MediaQuery.paddingOf(context).top),
               child: AspectRatio(
-                aspectRatio: ratio <= 0 ? 16 / 9 : ratio,
+                aspectRatio: 16 / 9,
                 child: _VideoSurface(
                   controller: _controller,
+                  webViewKey: _webViewKey,
                   loading: _loading,
                   error: _error,
-                  buffering: _lastBuffering,
-                  controlsVisible: _controlsVisible,
-                  muted: _muted,
                   fullscreen: false,
                   title: widget.target.title,
                   subtitle: _source.name,
-                  onTap: _toggleControls,
                   onBack: () => Navigator.of(context).pop(),
-                  onPlay: _togglePlay,
-                  onMute: _toggleMute,
                   onFullscreen: _toggleFullscreen,
                   onRetry: () => _loadSource(_sourceIndex, force: true),
                   sources: widget.target.sources,
@@ -313,24 +258,19 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
-  Widget _buildFullscreen(SportStyle style, double ratio) {
+  Widget _buildFullscreen() {
     return SizedBox.expand(
       child: ColoredBox(
         color: const Color(0xFF000000),
         child: _VideoSurface(
           controller: _controller,
+          webViewKey: _webViewKey,
           loading: _loading,
           error: _error,
-          buffering: _lastBuffering,
-          controlsVisible: _controlsVisible,
-          muted: _muted,
           fullscreen: true,
           title: widget.target.title,
           subtitle: _source.name,
-          onTap: _toggleControls,
           onBack: _exitFullscreen,
-          onPlay: _togglePlay,
-          onMute: _toggleMute,
           onFullscreen: _toggleFullscreen,
           onRetry: () => _loadSource(_sourceIndex, force: true),
           sources: widget.target.sources,
@@ -345,18 +285,13 @@ class _PlayerScreenState extends State<PlayerScreen>
 class _VideoSurface extends StatelessWidget {
   const _VideoSurface({
     required this.controller,
+    required this.webViewKey,
     required this.loading,
     required this.error,
-    required this.buffering,
-    required this.controlsVisible,
-    required this.muted,
     required this.fullscreen,
     required this.title,
     required this.subtitle,
-    required this.onTap,
     required this.onBack,
-    required this.onPlay,
-    required this.onMute,
     required this.onFullscreen,
     required this.onRetry,
     required this.sources,
@@ -364,19 +299,14 @@ class _VideoSurface extends StatelessWidget {
     required this.onSource,
   });
 
-  final VideoPlayerController? controller;
+  final WebViewController? controller;
+  final GlobalKey webViewKey;
   final bool loading;
   final String? error;
-  final bool buffering;
-  final bool controlsVisible;
-  final bool muted;
   final bool fullscreen;
   final String title;
   final String subtitle;
-  final VoidCallback onTap;
   final VoidCallback onBack;
-  final VoidCallback onPlay;
-  final VoidCallback onMute;
   final VoidCallback onFullscreen;
   final VoidCallback onRetry;
   final List<ChannelRef> sources;
@@ -385,168 +315,107 @@ class _VideoSurface extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final initialized = controller?.value.isInitialized == true;
-    final playing = controller?.value.isPlaying == true;
-
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          const ColoredBox(color: Color(0xFF000000)),
-          if (initialized)
-            Center(
-              child: AspectRatio(
-                aspectRatio: controller!.value.aspectRatio,
-                child: VideoPlayer(controller!),
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        const ColoredBox(color: Color(0xFF000000)),
+        if (controller != null)
+          WebViewWidget(key: webViewKey, controller: controller!),
+        if (loading)
+          _LoadingOverlay(
+            title: 'Conectando señal',
+            subtitle: 'Embed protegido · sin pop-ups',
+          ),
+        if (error == null)
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: Container(
+              padding: EdgeInsets.fromLTRB(
+                10,
+                fullscreen ? 14 : 8,
+                10,
+                22,
               ),
-            ),
-          if (initialized && !playing && !loading && error == null)
-            Center(
-              child: _RoundPlayButton(
-                icon: CupertinoIcons.play_fill,
-                onTap: onPlay,
-                size: 66,
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Color(0xC9000000), Color(0x00000000)],
+                ),
               ),
-            ),
-          if (loading)
-            _LoadingOverlay(
-              title: 'Conectando señal',
-              subtitle: 'Reproductor nativo · sin anuncios',
-            ),
-          if (buffering && !loading && error == null)
-            const Center(
-              child: CupertinoActivityIndicator(
-                radius: 14,
-                color: Color(0xFFD7FF3E),
-              ),
-            ),
-          AnimatedOpacity(
-            opacity: controlsVisible ? 1 : 0,
-            duration: const Duration(milliseconds: 180),
-            child: IgnorePointer(
-              ignoring: !controlsVisible,
-              child: Stack(
-                fit: StackFit.expand,
+              child: Row(
                 children: [
-                  const DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [
-                          Color(0xB3000000),
-                          Color(0x00000000),
-                          Color(0x00000000),
-                          Color(0xB3000000),
-                        ],
-                        stops: [0, 0.28, 0.62, 1],
-                      ),
-                    ),
+                  _GlassButton(
+                    icon: fullscreen
+                        ? CupertinoIcons.arrow_down_right
+                        : CupertinoIcons.back,
+                    onTap: onBack,
                   ),
-                  Positioned(
-                    top: fullscreen ? 14 : 8,
-                    left: 10,
-                    right: 10,
-                    child: Row(
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _GlassButton(
-                          icon: fullscreen
-                              ? CupertinoIcons.arrow_down_right
-                              : CupertinoIcons.back,
-                          onTap: onBack,
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                title,
-                                maxLines: fullscreen ? 1 : 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: AppText.body(
-                                  fullscreen ? 12 : 12.5,
-                                  weight: 700,
-                                  color: const Color(0xFFFFFFFF),
-                                  height: 1.2,
-                                ),
-                              ),
-                              if (!fullscreen) ...[
-                                const SizedBox(height: 2),
-                                Text(
-                                  subtitle,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: AppText.body(
-                                    9.5,
-                                    color: const Color(0x99FFFFFF),
-                                  ),
-                                ),
-                              ],
-                            ],
+                        Text(
+                          title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: AppText.body(
+                            fullscreen ? 12 : 12.5,
+                            weight: 700,
+                            color: const Color(0xFFFFFFFF),
+                            height: 1.2,
                           ),
                         ),
-                        const SizedBox(width: 8),
-                        if (playing)
-                          const LivePill(compact: true, pulse: false),
-                        const SizedBox(width: 8),
-                        _GlassButton(
-                          icon: muted
-                              ? CupertinoIcons.speaker_slash_fill
-                              : CupertinoIcons.speaker_2_fill,
-                          onTap: onMute,
-                        ),
+                        if (!fullscreen) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            subtitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: AppText.body(
+                              9.5,
+                              color: const Color(0x99FFFFFF),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
-                  if (initialized)
-                    Center(
-                      child: _RoundPlayButton(
-                        icon: playing
-                            ? CupertinoIcons.pause_fill
-                            : CupertinoIcons.play_fill,
-                        onTap: onPlay,
-                        size: 54,
-                        translucent: true,
-                      ),
-                    ),
-                  Positioned(
-                    left: 14,
-                    right: 14,
-                    bottom: fullscreen ? 16 : 10,
-                    child: Row(
-                      children: [
-                        const _GlassPill(
-                          icon: CupertinoIcons.shield_fill,
-                          label: 'SIN ANUNCIOS',
-                        ),
-                        const Spacer(),
-                        _GlassButton(
-                          icon: fullscreen
-                              ? CupertinoIcons.arrow_down_right
-                              : CupertinoIcons.arrow_up_left_arrow_down_right,
-                          onTap: onFullscreen,
-                        ),
-                      ],
-                    ),
+                  const SizedBox(width: 8),
+                  _GlassButton(
+                    icon: fullscreen
+                        ? CupertinoIcons.arrow_down_right
+                        : CupertinoIcons.arrow_up_left_arrow_down_right,
+                    onTap: onFullscreen,
                   ),
                 ],
               ),
             ),
           ),
-          if (error != null)
-            _ErrorOverlay(
-              message: error!,
-              onRetry: onRetry,
-              onBack: onBack,
-              sources: sources,
-              sourceIndex: sourceIndex,
-              onSource: onSource,
+        if (error == null && !loading)
+          Positioned(
+            left: 14,
+            bottom: fullscreen ? 16 : 10,
+            child: const IgnorePointer(
+              child: _GlassPill(
+                icon: CupertinoIcons.shield_fill,
+                label: 'SIN POP-UPS',
+              ),
             ),
-        ],
-      ),
+          ),
+        if (error != null)
+          _ErrorOverlay(
+            message: error!,
+            onRetry: onRetry,
+            onBack: onBack,
+            sources: sources,
+            sourceIndex: sourceIndex,
+            onSource: onSource,
+          ),
+      ],
     );
   }
 }
@@ -742,44 +611,6 @@ class _ErrorOverlay extends StatelessWidget {
             ),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _RoundPlayButton extends StatelessWidget {
-  const _RoundPlayButton({
-    required this.icon,
-    required this.onTap,
-    required this.size,
-    this.translucent = false,
-  });
-
-  final IconData icon;
-  final VoidCallback onTap;
-  final double size;
-  final bool translucent;
-
-  @override
-  Widget build(BuildContext context) {
-    final p = context.palette;
-    return PressableScale(
-      onTap: onTap,
-      child: Container(
-        width: size,
-        height: size,
-        decoration: BoxDecoration(
-          color: translucent ? const Color(0x33000000) : p.accent,
-          shape: BoxShape.circle,
-          border: Border.all(
-            color: translucent ? const Color(0x40FFFFFF) : p.accent,
-          ),
-        ),
-        child: Icon(
-          icon,
-          color: translucent ? const Color(0xFFFFFFFF) : p.onAccent,
-          size: size * 0.4,
-        ),
       ),
     );
   }
@@ -1018,7 +849,7 @@ class _PlayerDetails extends StatelessWidget {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        'La app reproduce la señal HLS directamente. No se carga la página del proveedor, así que no hay pop-ups ni anuncios.',
+                        'Usamos el embed del proveedor dentro de la app. Los scripts de anuncios y las ventanas emergentes quedan bloqueados.',
                         style: AppText.body(
                           9.5,
                           color: p.textMuted,

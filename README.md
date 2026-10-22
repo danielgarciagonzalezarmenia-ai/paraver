@@ -1,6 +1,6 @@
 # ParaVer
 
-Deporte en vivo, sin ruido. Una app Flutter para seguir la cartelera de deportes y ver las señales directamente en un reproductor nativo, sin WebView, sin anuncios y sin ventanas emergentes.
+Deporte en vivo, sin ruido. Una app Flutter para seguir la cartelera de deportes y ver las señales dentro de la app, con los anuncios y las ventanas emergentes del proveedor bloqueados.
 
 ## Qué incluye
 
@@ -9,8 +9,8 @@ Deporte en vivo, sin ruido. Una app Flutter para seguir la cartelera de deportes
 - Búsqueda de eventos y canales.
 - Favoritos guardados en el dispositivo.
 - Tema oscuro, claro o automático.
-- Reproductor nativo HLS con selector de fuentes, silencio y pantalla completa.
-- Resolución de señal en la app: extrae la playlist, firma el token y sirve el HLS mediante un proxy local para que el reproductor no cargue anuncios.
+- Reproductor integrado con selector de fuentes y pantalla completa.
+- Carga el embed del proveedor en un WebView aislado, elimina sus scripts publicitarios y bloquea ventanas emergentes y navegaciones externas.
 - Sin cuentas, sin analítica y sin permisos innecesarios.
 
 ## Requisitos
@@ -77,17 +77,17 @@ El workflow adjunta `ParaVer-unsigned.ipa` a la Release del tag.
 ```text
 lib/
   core/          tema, paleta y estilos por deporte
-  data/          cliente HTTP, parser, resolución de señales y proxy HLS
+  data/          cliente HTTP, parser, documentos del embed y saneamiento
   models/        eventos, canales, favoritos y objetivos de reproducción
   state/         estado global de la app
   ui/            pantallas, widgets y navegación
   utils/         fechas, zona horaria del Reino Unido y utilidades
 ```
 
-La cartelera se lee de `https://dlive.sx/`. Para reproducir, la app obtiene la página del reproductor, extrae la playlist y el identificador del canal, solicita un token temporal y sirve la playlist a través de `127.0.0.1` para que `video_player` reciba solo el HLS.
+La cartelera se lee de `https://dlive.sx/`. Para reproducir, la app obtiene la página del embed, elimina los scripts de anuncios y las llamadas emergentes, y la carga dentro de un WebView con origen `dembed.st` para que el reproductor del proveedor funcione sin salir de ParaVer.
 
 ## Aviso
 
-ParaVer no aloja ni retransmite contenido. Solo organiza enlaces públicos de terceros y los reproduce con un reproductor nativo. Los derechos de las retransmisiones pertenecen a sus titulares. La disponibilidad de las señales puede cambiar sin previo aviso.
+ParaVer no aloja ni retransmite contenido. Solo organiza enlaces públicos de terceros y muestra el reproductor del proveedor dentro de la app. Los derechos de las retransmisiones pertenecen a sus titulares. La disponibilidad de las señales puede cambiar sin previo aviso.
 
 Proyecto personal, sin afiliación con las webs de origen ni con las competiciones mostradas.

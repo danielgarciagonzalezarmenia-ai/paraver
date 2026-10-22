@@ -4,6 +4,7 @@ import 'package:flutter/widgets.dart';
 
 import '../core/sports.dart';
 import '../data/dlive_client.dart';
+import '../data/embed_document.dart';
 import '../data/local_store.dart';
 import '../data/stream_resolver.dart';
 import '../models/models.dart';
@@ -18,6 +19,7 @@ class AppState extends ChangeNotifier {
   final DliveClient _client;
 
   late final StreamResolver streams = StreamResolver(_client);
+  late final EmbedDocument embeds = EmbedDocument(_client);
 
   ScheduleSnapshot? _snapshot;
   ThemeChoice _themeChoice = ThemeChoice.system;

@@ -1,0 +1,49 @@
+name: paraver
+description: "ParaVer — deporte en vivo, sin ruido. Reproductor nativo sin anuncios."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  cupertino_icons: ^1.0.9
+  http: ^1.6.0
+  html: ^0.15.7
+  shared_preferences: ^2.5.6
+  video_player: ^2.11.1
+  intl: any
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/icon/
+    - assets/fonts/
+
+  fonts:
+    - family: SpaceGrotesk
+      fonts:
+        - asset: assets/fonts/SpaceGrotesk.ttf
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter.ttf
+
+flutter_launcher_icons:
+  image_path: "assets/icon/icon.png"
+  ios: true
+  remove_alpha_ios: true
+  android: true
+  adaptive_icon_background: "#070B12"
+  adaptive_icon_foreground: "assets/icon/icon_foreground.png"
+  min_sdk_android: 24
